@@ -13,6 +13,9 @@ VIT_REGEX = r".*visual\.blocks\.\d+\.(attn\.(qkv|proj)|mlp\.(linear_fc1|linear_f
 EXPECTED_MODULES = {"llm": 36 * 7, "llm+vit": 36 * 7 + 24 * 4}  # 252 và 348
 PROJECTOR_KEYS = ("visual.merger", "visual.deepstack_merger_list")
 EXTRA_FILE = "extra_trainable.pt"
+# Một số bản transformers so khớp tên module theo tiền tố đầy đủ ("model.visual..."), nên "visual" một mình
+# không đủ để giữ ViT ở fp16. Ghi cả hai dạng; load_model kiểm tra lại sau khi nạp.
+SKIP_QUANT = ["visual", "model.visual", "lm_head"]
 
 
 def target_regex(targets):
@@ -33,8 +36,13 @@ def _projector_key(name):
     return name[name.index("visual."):]
 
 
+def quantized_modules(model, key):
+    """Tên các lớp Linear 4-bit của bitsandbytes có chứa `key` trong tên."""
+    return [n for n, m in model.named_modules() if key in n and type(m).__name__ == "Linear4bit"]
+
+
 def _replace_param(model, name, data, trainable):
-    """Thay hẳn Parameter bằng một Parameter mới (đổi `.data` tại chỗ không đổi được kiểu của một số tham số)."""
+    """Thay Parameter bằng một Parameter mới (dtype và grad_dtype mới, không dính trạng thái cũ)."""
     import torch
     module_name, _, leaf = name.rpartition(".")
     module = model.get_submodule(module_name) if module_name else model
@@ -52,9 +60,15 @@ def load_model(model_id=MODEL_ID):
 
     quant = BitsAndBytesConfig(
         load_in_4bit=True, bnb_4bit_quant_type="nf4", bnb_4bit_compute_dtype=torch.float16,
-        bnb_4bit_use_double_quant=True, llm_int8_skip_modules=["visual", "lm_head"])
+        bnb_4bit_use_double_quant=True, llm_int8_skip_modules=SKIP_QUANT)
     model = Qwen3VLForConditionalGeneration.from_pretrained(
         model_id, quantization_config=quant, dtype=torch.float16, device_map={"": 0})
+    # ViT/projector bị lượng tử hoá thì E2/E3 không huấn luyện đầy đủ projector được (và E0 lệch đề): dừng ngay
+    bad = quantized_modules(model, "visual") + quantized_modules(model, "lm_head")
+    if bad:
+        raise RuntimeError(f"{len(bad)} lớp trong ViT/lm_head bị lượng tử hoá 4-bit, ví dụ {bad[:3]}. "
+                           f"Sửa SKIP_QUANT trong src/model_utils.py cho khớp tên module.")
+    print(f"4-bit: {len(quantized_modules(model, 'language_model'))} lớp Linear của LLM; ViT và lm_head giữ fp16")
     processor = AutoProcessor.from_pretrained(model_id)
     processor.tokenizer.padding_side = "left"  # cần cho generate theo batch
     return model, processor
@@ -87,6 +101,8 @@ def apply_setup(model, targets="llm", train_projector=False, r=16, alpha=None, d
     if train_projector:
         for name, p in list(peft_model.named_parameters()):
             if is_projector_param(name):
+                if not p.is_floating_point():  # trọng số 4-bit đã nén: đổi sang float chỉ ra số vô nghĩa
+                    raise RuntimeError(f"{name} bị lượng tử hoá ({p.dtype}): không huấn luyện đầy đủ được")
                 _replace_param(peft_model, name, p.detach().float(), trainable=True)
                 n_proj += p.numel()
     # GradScaler.unscale_ từ chối gradient fp16: mọi tham số huấn luyện phải là fp32

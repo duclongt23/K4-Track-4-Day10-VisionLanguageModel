@@ -54,3 +54,21 @@ def test_projector_param_detection_and_key():
     assert all(mu.is_projector_param(n) for n in yes)
     assert not any(mu.is_projector_param(n) for n in no)
     assert mu._projector_key(yes[0]) == "visual.merger.linear_fc1.weight"
+
+
+def test_quantized_modules_finds_only_4bit_layers():
+    import torch
+
+    class Linear4bit(torch.nn.Module):  # cùng tên lớp với bitsandbytes
+        pass
+
+    m = torch.nn.Module()
+    m.visual = torch.nn.Module()
+    m.visual.merger = torch.nn.Module()
+    m.visual.merger.linear_fc1 = Linear4bit()
+    m.visual.merger.norm = torch.nn.LayerNorm(4)
+    m.language_model = torch.nn.Module()
+    m.language_model.q_proj = Linear4bit()
+    assert mu.quantized_modules(m, "visual") == ["visual.merger.linear_fc1"]
+    assert mu.quantized_modules(m, "language_model") == ["language_model.q_proj"]
+    assert mu.quantized_modules(m, "lm_head") == []
