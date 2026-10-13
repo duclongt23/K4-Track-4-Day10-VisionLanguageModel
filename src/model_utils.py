@@ -33,6 +33,14 @@ def _projector_key(name):
     return name[name.index("visual."):]
 
 
+def _replace_param(model, name, data, trainable):
+    """Thay hẳn Parameter bằng một Parameter mới (đổi `.data` tại chỗ không đổi được kiểu của một số tham số)."""
+    import torch
+    module_name, _, leaf = name.rpartition(".")
+    module = model.get_submodule(module_name) if module_name else model
+    setattr(module, leaf, torch.nn.Parameter(data, requires_grad=trainable))
+
+
 def count_trainable(model):
     return sum(p.numel() for p in model.parameters() if p.requires_grad)
 
@@ -75,19 +83,19 @@ def apply_setup(model, targets="llm", train_projector=False, r=16, alpha=None, d
     peft_model = get_peft_model(model, cfg)
 
     # get_peft_model đóng băng mọi thứ ngoài adapter, nên phải mở projector SAU bước này.
+    n_proj = 0
     if train_projector:
-        n_proj = 0
-        for name, p in peft_model.named_parameters():
+        for name, p in list(peft_model.named_parameters()):
             if is_projector_param(name):
-                p.data = p.data.float()  # fp32: GradScaler/AdamW không làm việc được với gradient fp16
-                p.requires_grad = True
+                _replace_param(peft_model, name, p.detach().float(), trainable=True)
                 n_proj += p.numel()
-    else:
-        n_proj = 0
     # GradScaler.unscale_ từ chối gradient fp16: mọi tham số huấn luyện phải là fp32
-    for p in peft_model.parameters():
+    for name, p in list(peft_model.named_parameters()):
         if p.requires_grad and p.dtype != torch.float32:
-            p.data = p.data.float()
+            _replace_param(peft_model, name, p.detach().float(), trainable=True)
+    bad = [n for n, p in peft_model.named_parameters() if p.requires_grad and p.dtype != torch.float32]
+    if bad:
+        raise RuntimeError(f"{len(bad)} tham số huấn luyện vẫn không phải fp32: {bad[:3]}")
 
     info = {"targets": targets, "train_projector": train_projector, "r": r, "alpha": alpha or 2 * r,
             "matched_modules": len(matched), "projector_params": n_proj,
@@ -116,11 +124,11 @@ def load_extra(model, path):
     """Nạp lại projector đã huấn luyện, giữ fp32 như lúc train (chạy generate trong autocast fp16)."""
     import torch
     saved = torch.load(path, map_location="cpu")
-    params = {_projector_key(n): p for n, p in model.named_parameters() if is_projector_param(n)}
-    if set(saved) != set(params):
-        raise ValueError(f"projector không khớp: thiếu {sorted(set(params) - set(saved))[:3]}, "
-                         f"thừa {sorted(set(saved) - set(params))[:3]}")
-    with torch.no_grad():
-        for k, v in saved.items():
-            params[k].data = v.to(params[k].device, torch.float32)
+    names = {_projector_key(n): n for n, _ in model.named_parameters() if is_projector_param(n)}
+    if set(saved) != set(names):
+        raise ValueError(f"projector không khớp: thiếu {sorted(set(names) - set(saved))[:3]}, "
+                         f"thừa {sorted(set(saved) - set(names))[:3]}")
+    device = next(model.parameters()).device
+    for k, v in saved.items():
+        _replace_param(model, names[k], v.to(device, torch.float32), trainable=False)
     return len(saved)
