@@ -155,6 +155,15 @@ def train(model, processor, entries, cfg, out_dir, data_dir="data", max_steps=No
                                          "giảm lr hoặc batch_size, và kiểm tra lại mask")
             scaler.scale(loss).backward()
             step_loss += loss.item()
+        # GradScaler từ chối gradient fp16: ép về fp32 (và in tên tham số lỗi một lần để truy nguồn)
+        bad = [(n, p.dtype, p.grad.dtype) for n, p in model.named_parameters()
+               if p.grad is not None and p.grad.dtype != torch.float32]
+        if bad:
+            if step == 1:
+                print(f"{len(bad)} tham số có gradient không phải fp32, ví dụ: {bad[:3]}")
+            for p in params:
+                if p.grad is not None and p.grad.dtype != torch.float32:
+                    p.grad = p.grad.float()
         scaler.unscale_(opt)
         torch.nn.utils.clip_grad_norm_(params, 1.0)
         scaler.step(opt)
