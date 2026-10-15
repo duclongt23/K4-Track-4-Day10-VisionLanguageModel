@@ -7,7 +7,8 @@ from pathlib import Path
 
 from src.data_utils import load_split
 from src.inference import load_for_inference, run_inference, score_run
-from src.model_utils import apply_setup_from_cfg, load_model
+from src.grpo import grpo_train
+from src.model_utils import EXTRA_FILE, apply_setup_from_cfg, load_model, load_trainable
 from src.training import train
 
 
@@ -56,6 +57,54 @@ def run_experiment(cfg, tag, work_dir="work", data_dir="data", evidence_dir="rep
         gc.collect()
         torch.cuda.empty_cache()
     print({k: run[k] for k in ("trainable_params", "peak_vram_gb", "train_minutes", "final_loss")})
+
+    model, processor = load_for_inference(run_dir / "final")
+    entries = load_split(split, data_dir, limit=limit)
+    pred = run_inference(model, processor, entries, Path(work_dir) / f"{tag}.jsonl", data_dir, coord)
+    result = score_run(pred, tag.upper(), Path(evidence_dir) / f"{tag}.json", run_dir / "run.json",
+                       split=split, coord=coord, data_dir=data_dir)
+    del model
+    gc.collect()
+    torch.cuda.empty_cache()
+    return result
+
+
+def run_grpo(cfg, base_adapter, tag="e5", work_dir="work", data_dir="data", evidence_dir="report/evidence",
+             copy_to=None, split="test", debug=False, reuse_adapter=False):
+    """E5: GRPO bắt đầu từ adapter tốt nhất (`base_adapter`, thư mục có adapter_config.json), rồi chấm trên test.
+
+    cfg: configs/e5.yaml. debug=True: 3 bước, 8 ảnh val, ghi vào work/debug.
+    reuse_adapter=True: đã có work/<tag>/final thì bỏ qua huấn luyện, chỉ suy luận và chấm lại.
+    """
+    import torch
+
+    cfg = copy.deepcopy(cfg)
+    base_adapter = Path(base_adapter)
+    if not (base_adapter / "adapter_config.json").exists():
+        raise FileNotFoundError(f"không thấy adapter khởi tạo ở {base_adapter}")
+    coord = cfg.get("coord", "norm1000")
+    if debug:
+        split, evidence_dir, steps, limit = "val", Path(work_dir) / "debug", 3, 8
+        tag, reuse_adapter = f"{tag}_debug", False
+    else:
+        steps, limit = None, None
+    run_dir = Path(work_dir) / tag
+
+    if reuse_adapter and copy_to:
+        _restore_from_drive(run_dir, copy_to)
+    if reuse_adapter and (run_dir / "final" / "adapter_config.json").exists() and (run_dir / "run.json").exists():
+        run = json.loads((run_dir / "run.json").read_text(encoding="utf-8"))
+        print(f"BỎ QUA GRPO, dùng adapter có sẵn ở {run_dir / 'final'}")
+    else:
+        model, processor, info = load_trainable(base_adapter)
+        print("khởi tạo từ", base_adapter, info)
+        entries = load_split("train", data_dir, seed=cfg.get("seed", 42))
+        run = grpo_train(model, processor, entries, cfg, run_dir, data_dir, max_steps=steps, copy_to=copy_to,
+                         save_projector=(base_adapter / EXTRA_FILE).exists())
+        del model
+        gc.collect()
+        torch.cuda.empty_cache()
+    print({k: run[k] for k in ("trainable_params", "peak_vram_gb", "train_minutes", "final_reward")})
 
     model, processor = load_for_inference(run_dir / "final")
     entries = load_split(split, data_dir, limit=limit)

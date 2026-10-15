@@ -1,5 +1,5 @@
 """Reward IoU cho GRPO (E5, tuỳ chọn). Python thuần nên test được mà không cần GPU."""
-from scripts.score import IOU_THR, iou_xyxy, parse_output
+from scripts.score import IOU_THR, _gt_boxes, iou_xyxy, parse_output
 
 BASE_REWARD = 0.2  # thưởng cho JSON hợp lệ
 
@@ -28,3 +28,8 @@ def reward(completion, gt_boxes):
         used_p.add(j)
         total += v
     return BASE_REWARD + (1 - BASE_REWARD) * total / max(len(gt_boxes), len(pred), 1)
+
+
+def entry_gt_boxes(entry):
+    """Box đúng của một dòng split, theo thang 0-1000 như output của model (không làm tròn, giống scorer)."""
+    return _gt_boxes(entry)

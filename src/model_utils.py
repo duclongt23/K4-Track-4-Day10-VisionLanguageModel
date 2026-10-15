@@ -3,6 +3,7 @@
 Các import nặng (torch, transformers, peft) nằm trong hàm để file import được ở máy không có GPU.
 """
 import re
+from pathlib import Path
 
 MODEL_ID = "Qwen/Qwen3-VL-4B-Instruct"
 
@@ -136,8 +137,10 @@ def save_extra(model, path):
     return len(state)
 
 
-def load_extra(model, path):
-    """Nạp lại projector đã huấn luyện, giữ fp32 như lúc train (chạy generate trong autocast fp16)."""
+def load_extra(model, path, trainable=False):
+    """Nạp lại projector đã huấn luyện, giữ fp32 như lúc train (chạy generate trong autocast fp16).
+
+    trainable=True: để tiếp tục huấn luyện projector (GRPO)."""
     import torch
     saved = torch.load(path, map_location="cpu")
     names = {_projector_key(n): n for n, _ in model.named_parameters() if is_projector_param(n)}
@@ -146,5 +149,26 @@ def load_extra(model, path):
                          f"thừa {sorted(set(saved) - set(names))[:3]}")
     device = next(model.parameters()).device
     for k, v in saved.items():
-        _replace_param(model, names[k], v.to(device, torch.float32), trainable=False)
+        _replace_param(model, names[k], v.to(device, torch.float32), trainable=trainable)
     return len(saved)
+
+
+def load_trainable(adapter_dir, model_id=MODEL_ID):
+    """Nạp model gốc + adapter đã huấn luyện ở chế độ TIẾP TỤC HUẤN LUYỆN (khởi tạo cho GRPO)."""
+    import torch
+    from peft import PeftModel
+
+    model, processor = load_model(model_id)
+    for p in model.parameters():
+        p.requires_grad = False
+    model.enable_input_require_grads()
+    model = PeftModel.from_pretrained(model, str(adapter_dir), is_trainable=True)
+    extra = Path(adapter_dir) / EXTRA_FILE
+    n_proj = load_extra(model, extra, trainable=True) if extra.exists() else 0
+    for name, p in list(model.named_parameters()):
+        if p.requires_grad and p.dtype != torch.float32:
+            _replace_param(model, name, p.detach().float(), trainable=True)
+    bad = [n for n, p in model.named_parameters() if p.requires_grad and p.dtype != torch.float32]
+    if bad:
+        raise RuntimeError(f"{len(bad)} tham số huấn luyện vẫn không phải fp32: {bad[:3]}")
+    return model, processor, {"trainable_params": count_trainable(model), "projector_tensors": n_proj}
